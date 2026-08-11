@@ -6,12 +6,17 @@ set -euo pipefail
 #
 # The zip contains the kernel image, meta.inf (manifest) and a recovery
 # update-binary that patches the CURRENT device boot partition on-device with
-# ksud (KernelSU's userspace tool, `boot-patch --no-install`) and flashes it
-# straight back to /dev/block/by-name/boot$SLOT.
+# ksud (`boot-patch --no-install`) and flashes it straight back to
+# /dev/block/by-name/boot$SLOT.
 #
-# KernelSU is built into the CloudFox kernel source itself, so the patch only
-# replaces the kernel image: no kernelsu.ko LKM and no ksuinit ramdisk
-# component are involved (`--no-install` keeps the stock ramdisk intact).
+# ksud comes from the KernelSU project but is used here strictly as a boot-image
+# repacker -- a stand-in for magiskboot/mkbootimg. `--no-install` makes it
+# replace the kernel blob and nothing else: no kernelsu.ko LKM, no ksuinit, no
+# ramdisk changes of any kind. The installer therefore neither adds nor removes
+# root; whatever the device's boot image was patched with (Magisk, KernelSU, or
+# nothing at all) survives the flash untouched, and rooting stays entirely the
+# user's decision. Whether the kernel itself carries root is a compile-time
+# matter decided by the kernelsu defconfig fragment, excluded by default.
 #
 # Because patching happens on the device, no stock boot.img is needed: the zip
 # works on any device with a matching KMI (boot header v3+, which is what ksud
@@ -27,6 +32,9 @@ set -euo pipefail
 #                       ksu-ksud-<target>.zip is fetched from
 #   ZIP_OUT             Output zip path (default: ./cloudfox-kernel-flash.zip)
 #   KMI                 Kernel Module Interface id (default: android12-5.10)
+#   KERNEL_KERNELSU     meta.inf manifest value: true only when the kernel was
+#                       compiled with KernelSU (CONFIG_KSU=y). Default false,
+#                       matching the default root-free build.
 #
 # Options:
 #   -h, --help          Show this help
@@ -39,6 +47,7 @@ KSUD_ARMV7=${KSUD_ARMV7:-}
 KSUD_BASE=${KSUD_BASE:-}
 ZIP_OUT=${ZIP_OUT:-$PWD/cloudfox-kernel-flash.zip}
 KMI=${KMI:-android12-5.10}
+KERNEL_KERNELSU=${KERNEL_KERNELSU:-false}
 
 info() { printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
@@ -52,12 +61,14 @@ usage() {
 Usage: ./$SCRIPT_NAME [options]
 
 Packs a built kernel into a universal self-patching flashable zip. The zip's
-recovery update-binary runs the ksud binary on-device, replaces the kernel in
-the current boot image (`boot-patch --no-install`, KernelSU is in-kernel) and
-flashes it to /dev/block/by-name/boot\$SLOT (current-slot detection).
+recovery update-binary runs the ksud binary on-device as a boot-image repacker,
+replaces the kernel blob in the current boot image (\`boot-patch --no-install\`:
+the ramdisk, and any root installed in it, is left untouched) and flashes the
+result to /dev/block/by-name/boot\$SLOT (current-slot detection). No root is
+installed or removed by this package.
 
 Environment: KERNEL_IMAGE (required), KSUD_ARM64, KSUD_ARMV7 or KSUD_BASE,
-ZIP_OUT, KMI.
+ZIP_OUT, KMI, KERNEL_KERNELSU.
 
 Options:
   -h, --help           Show this help
@@ -127,13 +138,14 @@ done
 mkdir -p "$stage/META-INF/com/google/android"
 
 # meta.inf: payload manifest (KernelSU integrated-kernel style keys + ours).
-# KernelSU is built into the kernel, hence KERNEL_KERNELSU=true.
+# KERNEL_KERNELSU describes the kernel blob, not the installer: false for the
+# default root-free build, overridable for a run that opted into CONFIG_KSU=y.
 {
     printf 'KERNEL_BOOT_IMAGE=boot.img\n'
     printf 'KERNEL_BOOT_IMAGE_FOLDER=.\n'
     printf 'KERNEL_BOOT_IMAGE_AB=true\n'
     printf 'KERNEL_KMI=%s\n' "$KMI"
-    printf 'KERNEL_KERNELSU=true\n'
+    printf 'KERNEL_KERNELSU=%s\n' "$KERNEL_KERNELSU"
 } > "$stage/meta.inf"
 
 # update-binary: recovery installer invoked as
@@ -207,10 +219,12 @@ dd if="$BOOT" of="$TMPDIR/boot.img" bs=4M 2>/dev/null || die "cannot read $BOOT"
 [ "$(dd if="$TMPDIR/boot.img" bs=8 count=1 2>/dev/null)" = "ANDROID!" ] \
     || die "boot partition is not a boot image (unexpected content)"
 
-# KernelSU is in-kernel, so the ramdisk must stay untouched: --no-install
-# makes ksud replace the kernel image only. The kernel codec of the device
-# boot image is matched automatically (ksud recompresses the new kernel).
-ui_print "- Replacing kernel with ksud boot-patch..."
+# --no-install makes ksud replace the kernel image only and leave the ramdisk
+# exactly as it was, so this installer never adds or removes root: a device
+# patched with Magisk or KernelSU keeps it, an unrooted device stays unrooted.
+# The kernel codec of the device boot image is matched automatically (ksud
+# recompresses the new kernel).
+ui_print "- Replacing kernel (ramdisk and root setup left untouched)..."
 "$KSUD" boot-patch \
     --boot "$TMPDIR/boot.img" \
     --kernel "$TMPDIR/kernel" \

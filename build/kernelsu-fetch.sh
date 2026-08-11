@@ -2,9 +2,10 @@
 set -euo pipefail
 
 # Fetch the ksud binaries the flashable zip needs to replace the kernel on
-# device. KernelSU is built into the CloudFox kernel source itself, so no
-# kernelsu.ko LKM or ksuinit ramdisk component is required anymore: ksud's
-# `boot-patch --no-install` swaps only the kernel image.
+# device. ksud is used here only as a boot-image repacker: `boot-patch
+# --no-install` swaps the kernel blob and leaves the ramdisk alone, so no
+# kernelsu.ko LKM or ksuinit component is installed and the package neither
+# adds nor removes root. Only the binary comes from the KernelSU project.
 #
 # Artifacts are taken from the durable prebuilt release when KSU_PREBUILT_BASE
 # is set and the assets exist, otherwise from the latest successful GitHub

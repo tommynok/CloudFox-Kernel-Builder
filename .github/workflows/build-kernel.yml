@@ -31,11 +31,11 @@ name: build-kernel
           - clang 14
         default: "clang 19"
       pack_flashable:
-        description: 'Build a universal self-patching flashable zip (on-device kernel replacement via ksud)'
+        description: 'Build a universal self-patching flashable zip. It swaps the kernel blob in the current boot image and leaves the ramdisk untouched -- it never installs or removes root, whatever the device is patched with (Magisk, KernelSU, nothing).'
         type: boolean
         default: true
       defconfig_fragment_exclude:
-        description: 'Defconfig fragments to exclude (space- or comma-separated names). Default excludes kernelsu: the built kernel carries NO root. Clear this field to build the stock CloudFox kernel with KernelSU.'
+        description: 'Defconfig fragments to exclude (space- or comma-separated names). Default excludes kernelsu, so the built kernel carries NO root and rooting stays the user''s choice; a CONFIG_KSU=y leak fails the build. Clear this field to opt in and build the stock CloudFox kernel with KernelSU compiled in.'
         required: false
         default: "kernelsu"
       append_build_env:
@@ -134,11 +134,14 @@ jobs:
         env:
           KSU_PREBUILT_BASE: ${{ github.server_url }}/${{ github.repository }}/releases/download/prebuilts
         run: |
-          # ksud is only the on-device boot-image repacker used by the flashable
-          # zip (it swaps the kernel blob and nothing else). It does NOT inject
-          # root: whether the kernel has KernelSU is decided at compile time by
-          # the kernelsu defconfig fragment, which this workflow excludes by
-          # default. The fetch is network-bound and independent of the compile,
+          # ksud ships from the KernelSU project but is used here purely as the
+          # on-device boot-image repacker for the flashable zip: it swaps the
+          # kernel blob and nothing else (`boot-patch --no-install`), so the
+          # ramdisk -- and any root the user already installed, or the absence
+          # of one -- is left exactly as found. Root is never injected at
+          # install time; it is a compile-time decision made by the kernelsu
+          # defconfig fragment, which this workflow excludes by default.
+          # The fetch is network-bound and independent of the compile,
           # so overlap it instead of serializing behind the ~180 minute build.
           ksu_pid=""
           if [ "${{ inputs.pack_flashable }}" == "true" ]; then
@@ -171,17 +174,61 @@ jobs:
       - name: Verify no root in built kernel
         run: |
           set -euo pipefail
+          # A run that excludes the kernelsu fragment promises a root-free
+          # kernel, so a CONFIG_KSU=y slipping through is a hard failure, not a
+          # warning -- publishing a "no root" release that roots the device is
+          # the one outcome this builder must never produce. Clearing the
+          # exclusion input is an explicit opt-in to root and only reports.
+          case " ${DEFCONFIG_FRAGMENT_EXCLUDE//,/ } " in
+            *" kernelsu "*|*" kernelsu-gki "*|*" kernelsu-gki.config "*) norootcontract=1 ;;
+            *) norootcontract="" ;;
+          esac
+
           cfg=$(find work/dist -maxdepth 1 -name '.config' -print -quit)
           [ -n "$cfg" ] || cfg=$(find work/dist -maxdepth 1 -name 'ikconfig' -print -quit)
           if [ -z "$cfg" ]; then
+            # Fall back to the image itself: arm64 Image is uncompressed, so a
+            # compiled-in KernelSU leaves its strings in the binary.
+            img=$(find work/dist -maxdepth 1 -name 'Image' -print -quit)
+            if [ -n "$norootcontract" ] && [ -n "$img" ]; then
+              if grep -aq 'KernelSU' "$img"; then
+                echo "::error::KernelSU strings found in $img -- kernel is NOT root-free"
+                exit 1
+              fi
+              echo "OK: no KernelSU strings in $img (config unavailable, image scanned)"
+              exit 0
+            fi
+            if [ -n "$norootcontract" ]; then
+              echo "::error::no .config/ikconfig/Image in work/dist; cannot verify the no-root contract"
+              exit 1
+            fi
             echo "::warning::no .config/ikconfig in work/dist; cannot verify"
             exit 0
           fi
+
           if grep -q '^CONFIG_KSU=y' "$cfg"; then
-            echo "::warning::CONFIG_KSU=y -- this kernel HAS KernelSU built in"
+            if [ -n "$norootcontract" ]; then
+              echo "::error::CONFIG_KSU=y despite the kernelsu fragment being excluded -- refusing to publish a kernel that carries root"
+              exit 1
+            fi
+            echo "::warning::CONFIG_KSU=y -- this kernel HAS KernelSU built in (opted in by clearing the fragment exclusion)"
           else
             echo "OK: CONFIG_KSU is not enabled; kernel carries no root"
           fi
+
+          # Root-agnostic guarantees: the kernel ships no root, but must keep
+          # the facilities a user needs to add one afterwards (see
+          # build/fragments/cloudfox/rootagnostic-gki.config).
+          missing=""
+          for sym in CONFIG_MODULES CONFIG_MODULE_UNLOAD CONFIG_KPROBES CONFIG_KALLSYMS_ALL; do
+            grep -q "^$sym=y" "$cfg" || missing="$missing $sym"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::root-agnostic guarantees missing from the built config:$missing"
+            exit 1
+          fi
+          echo "OK: MODULES/MODULE_UNLOAD/KPROBES/KALLSYMS_ALL present; user can add root of their choice"
+
           grep -E '^CONFIG_(LTO_CLANG_FULL|ZRAM|ZRAM_MULTI_COMP|CRYPTO_LZ4KD)=' "$cfg" || true
 
       - name: Pack flashable kernel zip
@@ -203,6 +250,17 @@ jobs:
             exit 1
           fi
           mkdir -p work/pkg
+          # meta.inf's KERNEL_KERNELSU describes the kernel blob. The verify
+          # step above already guarantees CONFIG_KSU is off for the default
+          # root-free build; derive the flag from the config so an opt-in root
+          # build still gets an honest manifest.
+          ksu_flag=false
+          cfg=$(find work/dist -maxdepth 1 -name '.config' -print -quit)
+          [ -n "$cfg" ] || cfg=$(find work/dist -maxdepth 1 -name 'ikconfig' -print -quit)
+          if [ -n "$cfg" ] && grep -q '^CONFIG_KSU=y' "$cfg"; then
+            ksu_flag=true
+          fi
+          KERNEL_KERNELSU="$ksu_flag" \
           KERNEL_IMAGE="$kernel_img" \
           KSUD_ARM64="$PWD/kernelsu/ksud-aarch64-linux-android" \
           KSUD_ARMV7="$PWD/kernelsu/ksud-armv7-linux-androideabi" \

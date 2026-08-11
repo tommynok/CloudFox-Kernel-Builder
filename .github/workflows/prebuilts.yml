@@ -179,7 +179,11 @@ jobs:
 
       - name: Mirror ksud binaries from upstream Actions run
         env:
+          # GH_TOKEN for the gh CLI in this step; GITHUB_TOKEN for
+          # kernelsu-mirror.sh, which reads that name and refuses to start
+          # without it (GitHub denies unauthenticated artifact downloads).
           GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ "$FORCE" != "1" ]; then

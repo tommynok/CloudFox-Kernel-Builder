@@ -35,9 +35,9 @@ name: build-kernel
         type: boolean
         default: true
       defconfig_fragment_exclude:
-        description: 'Defconfig fragments to exclude (space- or comma-separated names). Default excludes kernelsu+metamodule: the built kernel carries NO root. Clear this field to build the stock CloudFox kernel with KernelSU.'
+        description: 'Defconfig fragments to exclude (space- or comma-separated names). Default excludes kernelsu: the built kernel carries NO root. Clear this field to build the stock CloudFox kernel with KernelSU.'
         required: false
-        default: "kernelsu metamodule"
+        default: "kernelsu"
       append_build_env:
         description: 'Extra KEY=VALUE pairs appended to build.config.cloudfox (comma-separated, e.g. "TRIM_UNUSED_KSYMS=1,LOCALVERSION=-vanilla"; sourced by build.sh)'
         required: false

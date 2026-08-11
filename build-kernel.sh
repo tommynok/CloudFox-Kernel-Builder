@@ -21,6 +21,21 @@ PREBUILTS_TAG=${PREBUILTS_TAG:-prebuilts}
 ACK_PREBUILTS_BRANCH=${ACK_PREBUILTS_BRANCH:-master}
 CLANG_ASSET=${CLANG_ASSET:-clang-r536225-linux-x86.tar.zst}
 CLANG_UPSTREAM_REPO=${CLANG_UPSTREAM_REPO:-https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86}
+# Upstream directory name and branch used by the sparse-clone fallback when no
+# prebuilt clang bundle is available. The asset name carries the version
+# ("clang-r536225-linux-x86.tar.zst" -> "clang-r536225"), which is what the
+# upstream repo actually calls the directory -- NOT the name the kernel's
+# build.config.common pins (that one is an old ACK alias and does not exist
+# upstream; fetch_clang symlinks the pinned path to whatever it resolved).
+CLANG_UPSTREAM_NAME=${CLANG_UPSTREAM_NAME:-${CLANG_ASSET%%-linux-x86.tar.zst}}
+# Branch mapping matches .github/workflows/prebuilts.yml: the clang 14
+# toolchain lives on android14-dev, everything newer on master.
+if [ -z "${CLANG_UPSTREAM_BRANCH:-}" ]; then
+    case "$CLANG_UPSTREAM_NAME" in
+        clang-r450784e) CLANG_UPSTREAM_BRANCH=android14-dev ;;
+        *)              CLANG_UPSTREAM_BRANCH=$ACK_PREBUILTS_BRANCH ;;
+    esac
+fi
 KBUILD_TOOLS_ASSET=${KBUILD_TOOLS_ASSET:-kernel-build-tools.tar.zst}
 KBUILD_TOOLS_UPSTREAM_REPO=${KBUILD_TOOLS_UPSTREAM_REPO:-https://android.googlesource.com/kernel/prebuilts/build-tools}
 BUILDTOOLS_ASSET=${BUILDTOOLS_ASSET:-build-tools.tar.zst}
@@ -94,7 +109,12 @@ Defaults (all overridable via the matching environment variable):
                     release of PREBUILTS_REPO at tag PREBUILTS_TAG,
                     falling back to a sparse clone of the Google ACK
                     platform/prebuilts/clang/host/linux-x86 at
-                    ACK_PREBUILTS_BRANCH
+                    CLANG_UPSTREAM_BRANCH
+  CLANG_UPSTREAM_NAME  Version directory checked out by that fallback
+                    (default: derived from CLANG_ASSET, e.g.
+                    clang-r536225-linux-x86.tar.zst -> clang-r536225)
+  CLANG_UPSTREAM_BRANCH  Branch holding it (default: android14-dev for
+                    clang-r450784e, otherwise ACK_PREBUILTS_BRANCH)
   KBUILD_TOOLS_URL  kernel-build-tools bundle (tar.zst); falls back to a
                     git clone of the AOSP kernel/prebuilts/build-tools at
                     ACK_PREBUILTS_BRANCH
@@ -329,14 +349,12 @@ fetch_clang_extract() {
 fetch_clang() {
     local root=$WORK_DIR/prebuilts-master/clang/host/linux-x86
     local tarball=$WORK_DIR/downloads/clang.tar.zst
-    local pin pin_dir pin_name clang_dir
+    local pin pin_dir clang_dir
     pin=$(config_get "$WORK_DIR/$KERNEL_DIR/build.config.common" CLANG_PREBUILT_BIN)
     case "$pin" in
         */bin) pin_dir=${pin%/bin} ;;
         *)     pin_dir=$pin ;;
     esac
-    pin_name=${pin_dir##*/}
-    [ -z "$pin_name" ] && pin_name=clang-r416183b
     mkdir -p "$root"
     clang_dir=$(resolve_clang_dir || true)
     if [ -n "$clang_dir" ] && [ -x "$clang_dir/bin/clang" ]; then
@@ -352,12 +370,19 @@ fetch_clang() {
             curl_dl -fL --retry 3 -o "$tarball" "$CLANG_URL" || die "failed to download clang from $CLANG_URL"
             tar -I 'zstd -T0' -xf "$tarball" -C "$root"
         elif ! download_asset "$CLANG_ASSET" "$tarball"; then
-            warn "no prebuilt clang bundle, sparse-cloning $CLANG_UPSTREAM_REPO"
+            warn "no prebuilt clang bundle, sparse-cloning $CLANG_UPSTREAM_NAME from $CLANG_UPSTREAM_REPO (branch $CLANG_UPSTREAM_BRANCH)"
+            warn "this pulls several GB; run the prebuilts workflow to publish $CLANG_ASSET and make future builds fast"
             rm -rf "$root"
             git clone -q --depth 1 --filter=blob:none --sparse \
-                -b "$ACK_PREBUILTS_BRANCH" "$CLANG_UPSTREAM_REPO" "$root" \
-                || { rm -rf "$root"; git clone -q --depth 1 -b "$ACK_PREBUILTS_BRANCH" "$CLANG_UPSTREAM_REPO" "$root"; }
-            git -C "$root" sparse-checkout set "$pin_name"
+                -b "$CLANG_UPSTREAM_BRANCH" "$CLANG_UPSTREAM_REPO" "$root" \
+                || { rm -rf "$root"; git clone -q --depth 1 -b "$CLANG_UPSTREAM_BRANCH" "$CLANG_UPSTREAM_REPO" "$root"; }
+            # Check out the upstream version directory, not the alias pinned by
+            # build.config.common: the pinned name (e.g. clang-r416183b) is not
+            # present upstream, so asking for it yields an empty tree and the
+            # build only fails later with a confusing "no usable clang".
+            git -C "$root" sparse-checkout set "$CLANG_UPSTREAM_NAME"
+            [ -x "$root/$CLANG_UPSTREAM_NAME/bin/clang" ] \
+                || die "sparse checkout of $CLANG_UPSTREAM_NAME produced no clang binary; check that branch $CLANG_UPSTREAM_BRANCH of $CLANG_UPSTREAM_REPO still carries it (override with CLANG_UPSTREAM_NAME/CLANG_UPSTREAM_BRANCH, or CLANG_URL for a direct tarball)"
         else
             tar -I 'zstd -T0' -xf "$tarball" -C "$root"
         fi

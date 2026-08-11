@@ -17,7 +17,7 @@ name: build-kernel
       kernel_branch:
         description: 'Kernel source branch'
         required: false
-        default: ""
+        default: "android12-5.10-cloudfox"
       kernel_commit:
         description: 'Kernel source commit'
         required: false
@@ -35,9 +35,9 @@ name: build-kernel
         type: boolean
         default: true
       defconfig_fragment_exclude:
-        description: 'Defconfig fragments to exclude (space- or comma-separated names)'
+        description: 'Defconfig fragments to exclude (space- or comma-separated names). Default excludes kernelsu+metamodule: the built kernel carries NO root. Clear this field to build the stock CloudFox kernel with KernelSU.'
         required: false
-        default: ""
+        default: "kernelsu metamodule"
       append_build_env:
         description: 'Extra KEY=VALUE pairs appended to build.config.cloudfox (comma-separated, e.g. "TRIM_UNUSED_KSYMS=1,LOCALVERSION=-vanilla"; sourced by build.sh)'
         required: false
@@ -47,7 +47,7 @@ name: build-kernel
         required: false
         default: ""
       ccache:
-        description: 'Accelerate with ccache. Branch-agnostic: objects shared across kernel branches/commits are reused from a cross-run cache; first run is cold, later runs (incl. different branches) get partial hits.'
+        description: 'Accelerate with ccache. Cache is keyed by clang+repo+branch+fragment-exclusion, so runs with the same config reuse objects; changing the excluded fragments changes autoconf.h and forces a mostly cold rebuild once.'
         type: boolean
         default: true
 
@@ -82,20 +82,43 @@ jobs:
           sudo bash build/free-disk-space.sh
           df -h
 
+      - name: Compute ccache key
+        id: cachekey
+        run: |
+          set -euo pipefail
+          # The excluded-fragment set changes the effective defconfig, hence
+          # autoconf.h, hence nearly every object hash. Mixing those builds in
+          # one cache bucket means each run evicts the other's objects and both
+          # stay permanently cold, so the exclusion set is part of the key.
+          # Normalized (comma->space, sorted, deduped) so "kernelsu metamodule",
+          # "metamodule,kernelsu" and "kernelsu  metamodule" share one bucket.
+          norm=$(printf '%s' "${DEFCONFIG_FRAGMENT_EXCLUDE:-none}" \
+                 | tr ',' ' ' | tr -s ' ' '\n' | sed '/^$/d' | sort -u | paste -sd- -)
+          [ -n "$norm" ] || norm=none
+          echo "frag=$norm" >> "$GITHUB_OUTPUT"
+          # Kernel branch is part of the key too; an empty input resolves to the
+          # repo default branch, which would otherwise share a bucket with an
+          # explicitly named different branch.
+          echo "branch=${KERNEL_BRANCH:-default}" >> "$GITHUB_OUTPUT"
+          echo "repo=$(printf '%s' "${KERNEL_REPO:-upstream}" | tr -c 'A-Za-z0-9._-' '-')" >> "$GITHUB_OUTPUT"
+          echo "ccache bucket: cfx-ccache-$CLANG_ASSET-...-$norm"
+
       - name: Restore ccache cache
         if: ${{ inputs.ccache }}
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: work/.ccache
-          # Branch-agnostic: the primary key includes the branch, but
-          # restore-keys fall back to the clang/repo prefix so a *different*
-          # branch's run shares the same bucket. ccache hashes each object's
-          # content, so shared kernel source across branches still hits.
-          key: cfx-ccache-${{ env.CLANG_ASSET }}-${{ inputs.kernel_repo }}-${{ inputs.kernel_branch }}
+          # Exact bucket first. restore-keys then walk outward: same config on
+          # an older run, then any run of this branch, then any run on this
+          # clang. ccache hashes object content, so even a loose match still
+          # yields partial hits on the large amount of source shared between
+          # configs; a cold start only costs the first build.
+          key: cfx-ccache-${{ env.CLANG_ASSET }}-${{ steps.cachekey.outputs.repo }}-${{ steps.cachekey.outputs.branch }}-${{ steps.cachekey.outputs.frag }}-${{ github.run_id }}
           restore-keys: |
-            cfx-ccache-${{ env.CLANG_ASSET }}-${{ inputs.kernel_repo }}-
+            cfx-ccache-${{ env.CLANG_ASSET }}-${{ steps.cachekey.outputs.repo }}-${{ steps.cachekey.outputs.branch }}-${{ steps.cachekey.outputs.frag }}-
+            cfx-ccache-${{ env.CLANG_ASSET }}-${{ steps.cachekey.outputs.repo }}-${{ steps.cachekey.outputs.branch }}-
+            cfx-ccache-${{ env.CLANG_ASSET }}-${{ steps.cachekey.outputs.repo }}-
             cfx-ccache-${{ env.CLANG_ASSET }}-
-          fail-on-cache-miss: false
 
       - name: Add 24G swap
         run: |
@@ -111,9 +134,12 @@ jobs:
         env:
           KSU_PREBUILT_BASE: ${{ github.server_url }}/${{ github.repository }}/releases/download/prebuilts
         run: |
-          # The ksud fetch is network-bound and independent of the kernel build
-          # (it only needs the repo checkout); overlap it with the build instead
-          # of serializing it behind the ~180 minute compile.
+          # ksud is only the on-device boot-image repacker used by the flashable
+          # zip (it swaps the kernel blob and nothing else). It does NOT inject
+          # root: whether the kernel has KernelSU is decided at compile time by
+          # the kernelsu defconfig fragment, which this workflow excludes by
+          # default. The fetch is network-bound and independent of the compile,
+          # so overlap it instead of serializing behind the ~180 minute build.
           ksu_pid=""
           if [ "${{ inputs.pack_flashable }}" == "true" ]; then
             ./build/kernelsu-fetch.sh &
@@ -127,12 +153,36 @@ jobs:
             wait "$ksu_pid" || echo "::warning::ksud fetch failed; flashable zip will be skipped"
           fi
 
+      - name: ccache stats
+        if: ${{ inputs.ccache && always() }}
+        run: ccache -s 2>/dev/null || echo "ccache not available"
+
       - name: Save ccache cache
         if: ${{ inputs.ccache && always() }}
         uses: actions/cache/save@v4
         with:
           path: work/.ccache
-          key: cfx-ccache-${{ env.CLANG_ASSET }}-${{ inputs.kernel_repo }}-${{ inputs.kernel_branch }}
+          # run_id suffix makes every save a fresh, non-colliding entry, so the
+          # cache actually grows warmer across runs. GitHub's cache/save refuses
+          # to overwrite an existing key, which is why a fixed key would freeze
+          # the bucket at whatever the very first (cold) run produced.
+          key: cfx-ccache-${{ env.CLANG_ASSET }}-${{ steps.cachekey.outputs.repo }}-${{ steps.cachekey.outputs.branch }}-${{ steps.cachekey.outputs.frag }}-${{ github.run_id }}
+
+      - name: Verify no root in built kernel
+        run: |
+          set -euo pipefail
+          cfg=$(find work/dist -maxdepth 1 -name '.config' -print -quit)
+          [ -n "$cfg" ] || cfg=$(find work/dist -maxdepth 1 -name 'ikconfig' -print -quit)
+          if [ -z "$cfg" ]; then
+            echo "::warning::no .config/ikconfig in work/dist; cannot verify"
+            exit 0
+          fi
+          if grep -q '^CONFIG_KSU=y' "$cfg"; then
+            echo "::warning::CONFIG_KSU=y -- this kernel HAS KernelSU built in"
+          else
+            echo "OK: CONFIG_KSU is not enabled; kernel carries no root"
+          fi
+          grep -E '^CONFIG_(LTO_CLANG_FULL|ZRAM|ZRAM_MULTI_COMP|CRYPTO_LZ4KD)=' "$cfg" || true
 
       - name: Pack flashable kernel zip
         if: ${{ inputs.pack_flashable }}
@@ -195,7 +245,7 @@ jobs:
           else
             gh release create "$tag" \
               --title "CloudFox kernel build $tag" \
-              --notes "Built from ${{ inputs.kernel_repo || 'https://github.com/CloudFox-INC/CloudFox-Kernel' }} via Google's unmodified build.sh. $(date -u '+%Y-%m-%d %H:%M UTC')" \
+              --notes "Built from ${{ inputs.kernel_repo || 'https://github.com/CloudFox-INC/CloudFox-Kernel' }} via Google's unmodified build.sh. Excluded fragments: ${{ inputs.defconfig_fragment_exclude || 'none' }}. $(date -u '+%Y-%m-%d %H:%M UTC')" \
               "${assets[@]}"
           fi
           echo "release $tag updated"

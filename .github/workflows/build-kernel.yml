@@ -229,7 +229,17 @@ jobs:
           fi
           echo "OK: MODULES/MODULE_UNLOAD/KPROBES/KALLSYMS_ALL present; user can add root of their choice"
 
-          grep -E '^CONFIG_(LTO_CLANG_FULL|ZRAM|ZRAM_MULTI_COMP|CRYPTO_LZ4KD)=' "$cfg" || true
+          # ZRAM_DEF_COMP is a Kconfig choice, so it silently falls back to the
+          # Kconfig default (lzo-rle) if nothing pins it -- a regression that is
+          # invisible unless someone reads the built config. Surface it.
+          defcomp=$(grep -m1 '^CONFIG_ZRAM_DEF_COMP=' "$cfg" || true)
+          case "$defcomp" in
+            *'"lz4kdr"'*) echo "OK: $defcomp" ;;
+            "") echo "::warning::CONFIG_ZRAM_DEF_COMP absent from the built config" ;;
+            *) echo "::warning::$defcomp -- expected \"lz4kdr\"; the zram fragment's default was overridden or collapsed to the Kconfig default" ;;
+          esac
+
+          grep -E '^CONFIG_(LTO_CLANG_FULL|ZRAM|ZRAM_MULTI_COMP|ZRAM_WRITEBACK|CRYPTO_LZ4KD|CRYPTO_LZ4KDR)=' "$cfg" || true
 
       - name: Pack flashable kernel zip
         if: ${{ inputs.pack_flashable }}

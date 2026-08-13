@@ -35,9 +35,9 @@ name: build-kernel
         type: boolean
         default: true
       defconfig_fragment_exclude:
-        description: 'Defconfig fragments to exclude (space- or comma-separated names). Default excludes kernelsu, so the built kernel carries NO root and rooting stays the user''s choice; a CONFIG_KSU=y leak fails the build. Clear this field to opt in and build the stock CloudFox kernel with KernelSU compiled in.'
+        description: 'Defconfig fragments to exclude (space- or comma-separated names). Default is the vanilla set: kernelsu (so the kernel carries NO root and rooting stays the user''s choice; a CONFIG_KSU=y leak fails the build) and droidspaces (namespaces/netfilter that stock ACK leaves off, incl. PID_NS and USER_NS). Remove a name to opt back into that fragment.'
         required: false
-        default: "kernelsu"
+        default: "kernelsu droidspaces"
       append_build_env:
         description: 'Extra KEY=VALUE pairs appended to build.config.cloudfox (comma-separated, e.g. "TRIM_UNUSED_KSYMS=1,LOCALVERSION=-vanilla"; sourced by build.sh)'
         required: false
